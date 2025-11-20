@@ -301,6 +301,98 @@ impl<'a> SdpApi<'a> {
         mid
     }
 
+    /// Add audio or video media and get the `mid` that will be used.
+    ///
+    /// Each call will result in a new m-line in the offer identified by the [`Mid`].
+    ///
+    /// The mid is not valid to use until the SDP offer-answer dance is complete and
+    /// the mid been advertised via [`Event::MediaAdded`][crate::Event::MediaAdded].
+    ///
+    /// * `stream_id` is used to synchronize media. It is `a=msid-semantic: WMS <streamId>` line in SDP.
+    /// * `track_id` is becomes both the track id in `a=msid <streamId> <trackId>` as well as the
+    ///   CNAME in the RTP SDES.
+    ///
+    /// ```
+    /// # #[cfg(feature = "openssl")] {
+    /// # use str0m::{Rtc, media::MediaKind, media::Direction};
+    /// let mut rtc = Rtc::new();
+    ///
+    /// let mut changes = rtc.sdp_api();
+    ///
+    /// let mid = changes.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+    /// # }
+    /// ```
+    pub fn add_media_by_mid(
+        &mut self,
+        mid: Mid,
+        kind: MediaKind,
+        dir: Direction,
+        stream_id: Option<String>,
+        track_id: Option<String>,
+        simulcast: Option<crate::media::Simulcast>,
+    ) -> Mid {
+        // https://www.rfc-editor.org/rfc/rfc8830
+        // msid-id = 1*64token-char
+        fn is_token_char(c: &char) -> bool {
+            // token-char = %x21 / %x23-27 / %x2A-2B / %x2D-2E / %x30-39
+            // / %x41-5A / %x5E-7E
+            let u = *c as u32;
+            u == 0x21
+                || (0x23..=0x27).contains(&u)
+                || (0x2a..=0x2b).contains(&u)
+                || (0x2d..=0x2e).contains(&u)
+                || (0x30..=0x39).contains(&u)
+                || (0x41..=0x5a).contains(&u)
+                || (0x5e..0x7e).contains(&u)
+        }
+
+        let stream_id = if let Some(stream_id) = stream_id {
+            stream_id.chars().filter(is_token_char).take(64).collect()
+        } else {
+            Id::<20>::random().to_string()
+        };
+
+        let track_id = if let Some(track_id) = track_id {
+            track_id.chars().filter(is_token_char).take(64).collect()
+        } else {
+            Id::<20>::random().to_string()
+        };
+
+        let mut ssrcs = Vec::new();
+
+        // Main SSRC, not counting RTX.
+        let main_ssrc_count = simulcast.as_ref().map(|s| s.send.len()).unwrap_or(1);
+
+        for _ in 0..main_ssrc_count {
+            let rtx = kind.is_video().then(|| self.rtc.session.streams.new_ssrc());
+            ssrcs.push((self.rtc.session.streams.new_ssrc(), rtx));
+        }
+
+        // TODO: let user configure stream/track name.
+        let msid = Msid {
+            stream_id,
+            track_id: track_id.clone(),
+        };
+
+        let add = AddMedia {
+            mid,
+            cname: track_id,
+            msid,
+            kind,
+            dir,
+            ssrcs,
+            simulcast,
+
+            // Added later
+            pts: vec![],
+            exts: ExtensionMap::empty(),
+            index: 0,
+        };
+
+        self.changes.0.push(Change::AddMedia(add));
+        mid
+    }
+
     /// Change the direction of an already existing media.
     ///
     /// All media have a direction. The media can be added by this side via
