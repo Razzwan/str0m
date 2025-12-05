@@ -584,6 +584,15 @@ impl Streams {
             self.any_nack_active = None;
         }
 
+        // println!(
+        //     "stream_rx_by_midrid {:?}: existing_rids={:?}",
+        //     midrid,
+        //     self.streams_rx
+        //         .values()
+        //         .filter_map(|r| r.rid())
+        //         .collect::<Vec<_>>(),
+        // );
+
         self.streams_rx.values_mut().find(|s| s.is_midrid(midrid))
     }
 
