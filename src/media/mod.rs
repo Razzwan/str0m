@@ -14,8 +14,10 @@ use crate::rtp_::SRTP_OVERHEAD;
 use crate::RtcError;
 
 use crate::format::PayloadParams;
-use crate::sdp::Simulcast as SdpSimulcast;
-use crate::sdp::{MediaLine, Msid};
+use crate::sdp::{
+    MediaLine, Msid, RestrictionId, Simulcast as SdpSimulcast, SimulcastGroups,
+    SimulcastLayer as SdpSimulcastLayer,
+};
 use crate::streams::{RtpPacket, Streams};
 use crate::util::already_happened;
 
@@ -563,6 +565,7 @@ impl Media {
     ) -> Self {
         let cname = cname_from_mid(&l.mid());
         let kind = l.typ.clone().into();
+        let dir = l.direction().invert();
         Media {
             mid: l.mid(),
             index,
@@ -573,9 +576,43 @@ impl Media {
                 track_id: format!("{}_{}", cname, kind),
             }),
             kind,
-            dir: l.direction().invert(), // remote direction is reverse.
+            dir: dir.clone(), // remote direction is reverse.
             remote_created,
             cname,
+            simulcast: match &kind {
+                MediaKind::Audio => None,
+                MediaKind::Video => match &dir {
+                    // Direction::RecvOnly => Some(SdpSimulcast {
+                    //     send: SimulcastGroups(vec![]),
+                    //     recv: SimulcastGroups(vec![
+                    //         RestrictionId::new("low".to_owned(), true),
+                    //         RestrictionId::new("mid".to_owned(), true),
+                    //         // RestrictionId::new("max".to_owned(), true),
+                    //     ]),
+                    //     is_munged: true,
+                    // }),
+                    Direction::RecvOnly => None,
+                    Direction::SendOnly => Some(SdpSimulcast {
+                        send: SimulcastGroups(vec![
+                            SdpSimulcastLayer {
+                                restriction_id: RestrictionId::new("low".to_owned(), true),
+                                attributes: None,
+                            },
+                            SdpSimulcastLayer {
+                                restriction_id: RestrictionId::new("mid".to_owned(), true),
+                                attributes: None,
+                            },
+                            // SdpSimulcastLayer {
+                            //     restriction_id: RestrictionId::new("max".to_owned(), true),
+                            //     attributes: None,
+                            // },
+                        ]),
+                        recv: SimulcastGroups(vec![]),
+                        is_munged: true,
+                    }),
+                    _ => None,
+                },
+            },
             ..Default::default()
         }
     }
