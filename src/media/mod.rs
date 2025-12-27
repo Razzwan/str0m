@@ -561,19 +561,21 @@ impl Media {
         index: usize,
         remote_created: bool,
     ) -> Self {
+        let cname = cname_from_mid(&l.mid());
+        let kind = l.typ.clone().into();
         Media {
             mid: l.mid(),
             index,
             // This is not reflected back, and thus added by add_pending_changes().
             // cname,
-            msid: l.msid().unwrap_or(Msid::random()),
-            kind: l.typ.clone().into(),
-            dir: if l.disabled {
-                Direction::Inactive
-            } else {
-                l.direction().invert() // remote direction is reverse.
-            },
+            msid: l.msid().unwrap_or(Msid {
+                stream_id: cname.clone(),
+                track_id: format!("{}_{}", cname, kind),
+            }),
+            kind,
+            dir: l.direction().invert(), // remote direction is reverse.
             remote_created,
+            cname,
             ..Default::default()
         }
     }
@@ -622,5 +624,33 @@ impl Media {
             remote_exts: exts,
             ..Default::default()
         }
+    }
+}
+
+/// Creates stream_id and cname from mid value
+pub fn cname_from_mid(mid: &Mid) -> String {
+    let mid_str = format!("{}", mid);
+    match mid_str.as_str() {
+        "0" => "seat_01".to_owned(),
+        "1" => "seat_01".to_owned(),
+        "2" => "seat_02".to_owned(),
+        "3" => "seat_02".to_owned(),
+        "4" => "seat_03".to_owned(),
+        "5" => "seat_03".to_owned(),
+        "6" => "seat_04".to_owned(),
+        "7" => "seat_04".to_owned(),
+        "8" => "seat_05".to_owned(),
+        "9" => "seat_05".to_owned(),
+        "10" => "seat_06".to_owned(),
+        "11" => "seat_06".to_owned(),
+        "12" => "seat_07".to_owned(),
+        "13" => "seat_07".to_owned(),
+        "14" => "seat_08".to_owned(),
+        "15" => "seat_08".to_owned(),
+        "16" => "seat_09".to_owned(),
+        "17" => "seat_09".to_owned(),
+        "18" => "seat_10".to_owned(),
+        "19" => "seat_10".to_owned(),
+        x => format!("seat_{x}"),
     }
 }
