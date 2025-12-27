@@ -14,8 +14,10 @@ use crate::rtp_::SRTP_OVERHEAD;
 use crate::RtcError;
 
 use crate::format::PayloadParams;
-use crate::sdp::Simulcast as SdpSimulcast;
-use crate::sdp::{MediaLine, Msid};
+use crate::sdp::{
+    MediaLine, Msid, RestrictionId, Simulcast as SdpSimulcast, SimulcastGroups,
+    SimulcastLayer as SdpSimulcastLayer,
+};
 use crate::streams::{RtpPacket, Streams};
 use crate::util::already_happened;
 
@@ -561,19 +563,56 @@ impl Media {
         index: usize,
         remote_created: bool,
     ) -> Self {
+        let cname = cname_from_mid(&l.mid());
+        let kind = l.typ.clone().into();
+        let dir = l.direction().invert();
         Media {
             mid: l.mid(),
             index,
             // This is not reflected back, and thus added by add_pending_changes().
             // cname,
-            msid: l.msid().unwrap_or(Msid::random()),
-            kind: l.typ.clone().into(),
-            dir: if l.disabled {
-                Direction::Inactive
-            } else {
-                l.direction().invert() // remote direction is reverse.
-            },
+            msid: l.msid().unwrap_or(Msid {
+                stream_id: cname.clone(),
+                track_id: format!("{}_{}", cname, kind),
+            }),
+            kind,
+            dir: dir.clone(), // remote direction is reverse.
             remote_created,
+            cname,
+            simulcast: match &kind {
+                MediaKind::Audio => None,
+                MediaKind::Video => match &dir {
+                    // Direction::RecvOnly => Some(SdpSimulcast {
+                    //     send: SimulcastGroups(vec![]),
+                    //     recv: SimulcastGroups(vec![
+                    //         RestrictionId::new("low".to_owned(), true),
+                    //         RestrictionId::new("mid".to_owned(), true),
+                    //         // RestrictionId::new("max".to_owned(), true),
+                    //     ]),
+                    //     is_munged: true,
+                    // }),
+                    Direction::RecvOnly => None,
+                    Direction::SendOnly => Some(SdpSimulcast {
+                        send: SimulcastGroups(vec![
+                            SdpSimulcastLayer {
+                                restriction_id: RestrictionId::new("low".to_owned(), true),
+                                attributes: None,
+                            },
+                            SdpSimulcastLayer {
+                                restriction_id: RestrictionId::new("mid".to_owned(), true),
+                                attributes: None,
+                            },
+                            // SdpSimulcastLayer {
+                            //     restriction_id: RestrictionId::new("max".to_owned(), true),
+                            //     attributes: None,
+                            // },
+                        ]),
+                        recv: SimulcastGroups(vec![]),
+                        is_munged: true,
+                    }),
+                    _ => None,
+                },
+            },
             ..Default::default()
         }
     }
@@ -622,5 +661,33 @@ impl Media {
             remote_exts: exts,
             ..Default::default()
         }
+    }
+}
+
+/// Creates stream_id and cname from mid value
+pub fn cname_from_mid(mid: &Mid) -> String {
+    let mid_str = format!("{}", mid);
+    match mid_str.as_str() {
+        "0" => "seat_01".to_owned(),
+        "1" => "seat_01".to_owned(),
+        "2" => "seat_02".to_owned(),
+        "3" => "seat_02".to_owned(),
+        "4" => "seat_03".to_owned(),
+        "5" => "seat_03".to_owned(),
+        "6" => "seat_04".to_owned(),
+        "7" => "seat_04".to_owned(),
+        "8" => "seat_05".to_owned(),
+        "9" => "seat_05".to_owned(),
+        "10" => "seat_06".to_owned(),
+        "11" => "seat_06".to_owned(),
+        "12" => "seat_07".to_owned(),
+        "13" => "seat_07".to_owned(),
+        "14" => "seat_08".to_owned(),
+        "15" => "seat_08".to_owned(),
+        "16" => "seat_09".to_owned(),
+        "17" => "seat_09".to_owned(),
+        "18" => "seat_10".to_owned(),
+        "19" => "seat_10".to_owned(),
+        x => format!("seat_{x}"),
     }
 }
