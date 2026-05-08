@@ -415,7 +415,7 @@ impl Media {
         // Порог увеличен с 100 до 256: IDR-кейфрейм при 720p легко даёт 200+
         // RTP-пакетов. Основные фиксы (step_mini_poll всегда, no inline propagate)
         // предотвращают переполнение, но запас нужен при кратком всплеске.
-        if self.to_payload.len() > 256 {
+        if self.to_payload.len() > 512 {
             return Err(RtcError::WriteWithoutPoll);
         }
 
