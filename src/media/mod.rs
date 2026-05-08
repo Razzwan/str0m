@@ -412,7 +412,10 @@ impl Media {
     }
 
     fn set_to_payload(&mut self, to_payload: ToPayload) -> Result<(), RtcError> {
-        if self.to_payload.len() > 100 {
+        // Порог увеличен с 100 до 256: IDR-кейфрейм при 720p легко даёт 200+
+        // RTP-пакетов. Основные фиксы (step_mini_poll всегда, no inline propagate)
+        // предотвращают переполнение, но запас нужен при кратком всплеске.
+        if self.to_payload.len() > 256 {
             return Err(RtcError::WriteWithoutPoll);
         }
 
