@@ -1663,6 +1663,16 @@ impl Rtc {
         self.last_timeout_reason
     }
 
+    /// Returns the remote socket address currently nominated by the ICE agent
+    /// (i.e. `send_addr.destination`). This is the address from which RTP/DTLS/RTCP
+    /// packets arrive during steady-state operation and is used as the hash key in
+    /// the SFU routing table for O(1) packet dispatch.
+    ///
+    /// Returns `None` before ICE nominates a candidate pair.
+    pub fn nominated_remote_addr(&self) -> Option<SocketAddr> {
+        self.send_addr.as_ref().map(|sa| sa.destination)
+    }
+
     /// Check if this `Rtc` instance accepts the given input. This is used for demultiplexing
     /// several `Rtc` instances over the same UDP server socket.
     ///
