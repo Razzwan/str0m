@@ -829,7 +829,7 @@ impl IceAgent {
         // set is 100, but the value MUST be configurable.
         //
         // TODO: How does this work with trickle ice?
-        let max = self.max_candidate_pairs.unwrap_or(100);
+        let max = self.max_candidate_pairs.unwrap_or(256);
 
         let num_pairs = self.candidate_pairs.len();
         if num_pairs > max && !self.has_exceeded_max_candidate_pairs {
