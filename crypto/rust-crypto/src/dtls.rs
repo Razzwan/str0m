@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use str0m_proto::crypto::CryptoError;
 use str0m_proto::crypto::DtlsVersion;
+use str0m_proto::crypto::dtls::ProtocolVersion;
 use str0m_proto::crypto::dtls::{DtlsCert, DtlsImplError, DtlsInstance, DtlsOutput, DtlsProvider};
 
 // ============================================================================
@@ -30,6 +31,7 @@ impl DtlsProvider for RustCryptoDtlsProvider {
         cert: &DtlsCert,
         now: Instant,
         dtls_version: DtlsVersion,
+        mtu: Option<usize>,
     ) -> Result<Box<dyn DtlsInstance>, CryptoError> {
         let dimpl_cert = dimpl::DtlsCertificate {
             certificate: cert.certificate.clone(),
@@ -37,7 +39,11 @@ impl DtlsProvider for RustCryptoDtlsProvider {
         };
 
         // Create a default dimpl Config with RustCrypto crypto provider
-        let mut builder = dimpl::Config::builder();
+        // ICE verifies return routability before DTLS, making server cookies redundant.
+        let mut builder = dimpl::Config::builder().use_server_cookie(false);
+        if let Some(mtu) = mtu {
+            builder = builder.mtu(mtu);
+        }
         if self.is_test() {
             // We need the DTLS impl to be deterministic for the BWE tests.
             builder = builder.dangerously_set_rng_seed(42);
@@ -94,11 +100,27 @@ impl DtlsInstance for RustCryptoDtlsInstance {
         self.dtls.handle_timeout(now)
     }
 
-    fn send_application_data(&mut self, data: &[u8]) -> Result<(), DtlsImplError> {
+    fn send_application_data(&mut self, data: &[u8]) -> Result<usize, DtlsImplError> {
         self.dtls.send_application_data(data)
     }
 
     fn is_active(&self) -> bool {
         self.dtls.is_active()
+    }
+
+    fn protocol_version(&self) -> Option<ProtocolVersion> {
+        self.dtls.protocol_version()
+    }
+
+    fn is_closing(&self) -> bool {
+        self.dtls.is_closing()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.dtls.is_closed()
+    }
+
+    fn close(&mut self) -> Result<(), DtlsImplError> {
+        self.dtls.close()
     }
 }

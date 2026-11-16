@@ -1,9 +1,10 @@
 use super::{BitRead, CodecExtra, Depacketizer, PacketError, Packetizer};
+use crate::rtp_::{extend_u7, extend_u8, extend_u15};
 
 use std::fmt;
 
-/// Max VP9 RTP payload descriptor size for non-flexible mode:
-/// flags(1) + 15-bit PID(2) + L byte(1) + tl0picidx(1) + SS(3 on keyframes) = 8
+/// Max non-flexible VP9 descriptor size reserved for MTU headroom:
+/// flags(1) + PID(2) + L(1) + tl0picidx(1) + ≤1 SS byte on keyframe first-packets; 8 is a safe bound.
 const VP9_NON_FLEXIBLE_HEADER_SIZE: usize = 8;
 /// VP9 RTP payload descriptor size for flexible mode:
 /// flags(1) + 15-bit PID(2) = 3
@@ -17,7 +18,7 @@ pub enum Vp9PacketizerMode {
     /// Flexible mode (F=1): minimal 3-byte header (flags + 15-bit PID).
     /// Simpler but causes issues with Safari which drops inter-frames.
     Flexible,
-    /// Non-flexible mode (F=0): 5-8 byte header with layer indices and
+    /// Non-flexible mode (F=0): 5-6 byte header with layer indices and
     /// scalability structure. Compatible with all major browsers.
     #[default]
     NonFlexible,
@@ -68,7 +69,7 @@ pub struct Vp9CodecExtra {
     /// // We want to receive S1T2 layer.
     /// let (target_spatial, target_temporal) = (1u8, 2u8);
     ///
-    /// let mut media_data: MediaData = todo!();
+    /// let media_data: MediaData = todo!();
     ///
     /// if let CodecExtra::Vp9(vp9_extra) = media_data.codec_extra {
     ///     // Try to get current `temporal layer`. If `None` there is no SVC.
@@ -80,9 +81,8 @@ pub struct Vp9CodecExtra {
     ///             // border of data for the target `spatial layer`.
     ///             vp9_extra.layers_scheme[target_spatial as usize],
     ///         ) {
-    ///             // Cut off unwanted data of `spatial layer`s with spatial
-    ///             // indeces higher than `target_spatial`.
-    ///             media_data.data.drain(end_of_target_layer..);
+    ///             // Keep only the bytes for spatial layers up to `target_spatial`.
+    ///             let data = &media_data.data[..end_of_target_layer];
     ///         }
     ///     }
     /// }
@@ -103,10 +103,10 @@ pub struct Vp9CodecExtra {
     pub layers_heights: [Option<u16>; MAX_SPATIAL_LAYERS],
 
     /// Extended picture id of layer 0 frames, if present
-    pub tl0_picture_id: Option<u8>,
+    pub tl0_picture_id: Option<u64>,
 
-    /// Picture ID.
-    pub pid: u16,
+    /// Extended picture id, if present
+    pub picture_id: Option<u64>,
 
     /// Flag which indicates that within [`MediaData`], there is an individual frame
     /// containing complete and independent visual information. This frame serves
@@ -222,7 +222,7 @@ impl Packetizer for Vp9Packetizer {
             }
             #[cfg(not(test))]
             {
-                use crate::util::NonCryptographicRng;
+                use str0m_proto::NonCryptographicRng;
                 self.picture_id = NonCryptographicRng::u16() & 0x7FFF;
             }
             self.initialized = true;
@@ -292,8 +292,8 @@ impl Vp9Packetizer {
             let is_last = payload_data_remaining == current_fragment_size;
 
             // Non-keyframe: 5 bytes (flags + 15-bit PID + L + tl0picidx)
-            // Keyframe first packet: 8 bytes (+ 3 bytes SS data)
-            let ss_size = if is_keyframe && is_first { 3 } else { 0 };
+            // Keyframe first packet: 6 bytes (+ 1 byte SS data, G=0)
+            let ss_size = if is_keyframe && is_first { 1 } else { 0 };
             let header_size = 5 + ss_size;
             let mut out = Vec::with_capacity(header_size + current_fragment_size);
 
@@ -323,13 +323,10 @@ impl Vp9Packetizer {
             // tl0picidx (required when F=0 and L=1)
             out.push(self.tl0picidx);
 
-            // SS data on keyframe first packet (V=1)
+            // SS byte on keyframe first packet: N_S=0, Y=0, G=0 (no GOF). A single-layer stream has no
+            // GOF to advertise; a G=1/R=0 GOF mis-signals references (see commit msg). This matches what
+            // libwebrtc emits for non-scalable VP9 (g_bit = num_frames_in_gof > 0). RFC 9628 §4.2.
             if is_keyframe && is_first {
-                // N_S(3)|Y(1)|G(1)|RES(3) = N_S=0 (1 spatial layer), Y=0, G=1
-                out.push(0x08);
-                // N_G = 1 (1 picture in GOF)
-                out.push(0x01);
-                // GOF[0]: TID(3)|U(1)|R(2)|RES(2) = TID=0, U=0, R=0
                 out.push(0x00);
             }
 
@@ -438,8 +435,10 @@ pub struct Vp9Depacketizer {
     pub z: bool,
 
     /// Recommended headers
-    /// 7 or 16 bits, picture ID.
+    /// 7 or 15 bits, picture ID.
     pub picture_id: u16,
+    /// extended picture id
+    pub extended_pid: Option<u64>,
 
     /// Conditionally recommended headers
     /// Temporal layer ID
@@ -456,6 +455,8 @@ pub struct Vp9Depacketizer {
     pub pdiff: [u8; MAX_VP9REF_PICS],
     /// Temporal layer zero index (F=0)
     pub tl0picidx: u8,
+    /// extended version of tl0picidx
+    pub extended_tl0picidx: Option<u64>,
 
     /// Scalability structure headers
     /// N_S + 1 indicates the number of spatial layers present in the VP9 stream
@@ -572,11 +573,15 @@ impl Vp9Depacketizer {
             vp9_extra.tid = Some(self.tid);
 
             if !self.f {
-                vp9_extra.tl0_picture_id = Some(self.tl0picidx);
+                vp9_extra.tl0_picture_id = self.extended_tl0picidx;
             }
         }
 
-        vp9_extra.pid = self.picture_id;
+        // I: "Picture ID (PID) present" (RFC 9628 section 4.2). A packet without it
+        // keeps the picture id of an earlier packet of the same frame.
+        if self.i {
+            vp9_extra.picture_id = self.extended_pid;
+        }
         vp9_extra
             .layers_widths
             .copy_from_slice(&self.width[..MAX_SPATIAL_LAYERS]);
@@ -608,8 +613,10 @@ impl Vp9Depacketizer {
         }
         let b = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
         payload_index += 1;
+        let previous_picture_id = u64::from(self.picture_id);
+        let previous = self.extended_pid.map(|_| previous_picture_id);
         // PID present?
-        if (b & 0x80) != 0 {
+        let next = if (b & 0x80) != 0 {
             if reader.remaining_bits() == 0 {
                 return Err(PacketError::ErrShortPacket);
             }
@@ -617,9 +624,18 @@ impl Vp9Depacketizer {
             let x = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
             self.picture_id = (((b & 0x7f) as u16) << 8) | (x as u16);
             payload_index += 1;
+            extend_u15(previous, self.picture_id)
         } else {
             self.picture_id = (b & 0x7F) as u16;
-        }
+            extend_u7(previous, b)
+        };
+
+        // A wider wire ID is zero-extended after a width change. Preserve the
+        // offset from earlier short-ID wraps by extending the raw-ID delta.
+        self.extended_pid = Some(match self.extended_pid {
+            Some(previous) => previous.wrapping_add(next.wrapping_sub(previous_picture_id)),
+            None => next,
+        });
 
         Ok(payload_index)
     }
@@ -684,6 +700,7 @@ impl Vp9Depacketizer {
             return Err(PacketError::ErrShortPacket);
         }
         self.tl0picidx = reader.get_u8().ok_or(PacketError::ErrShortPacket)?;
+        self.extended_tl0picidx = Some(extend_u8(self.extended_tl0picidx, self.tl0picidx));
         payload_index += 1;
         Ok(payload_index)
     }
@@ -817,6 +834,7 @@ mod test {
     use super::*;
 
     #[test]
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     fn test_vp9_packet_unmarshal() -> Result<(), PacketError> {
         let tests: Vec<(&str, &[u8], Vp9Depacketizer, &[u8], Option<PacketError>)> = vec![
             (
@@ -839,6 +857,7 @@ mod test {
                 Vp9Depacketizer {
                     i: true,
                     picture_id: 0x02,
+                    extended_pid: Some(0x02),
                     ..Default::default()
                 },
                 &[0xAA],
@@ -850,6 +869,7 @@ mod test {
                 Vp9Depacketizer {
                     i: true,
                     picture_id: 0x01FF,
+                    extended_pid: Some(0x01FF),
                     ..Default::default()
                 },
                 &[0xAA],
@@ -876,10 +896,12 @@ mod test {
                     i: true,
                     l: true,
                     picture_id: 0x02,
+                    extended_pid: Some(0x02),
                     tid: 0x01,
                     sid: 0x01,
                     d: true,
                     tl0picidx: 0x01,
+                    extended_tl0picidx: Some(0x01),
                     ..Default::default()
                 },
                 &[0xAA],
@@ -893,6 +915,7 @@ mod test {
                     i: true,
                     l: true,
                     picture_id: 0x02,
+                    extended_pid: Some(0x02),
                     tid: 0x01,
                     sid: 0x01,
                     d: true,
@@ -923,6 +946,7 @@ mod test {
                     p: true,
                     f: true,
                     picture_id: 0x02,
+                    extended_pid: Some(0x02),
                     pdiff: [0x01, 0x02, 0],
                     ..Default::default()
                 },
@@ -944,6 +968,7 @@ mod test {
                     p: true,
                     f: true,
                     picture_id: 0x02,
+                    extended_pid: Some(0x02),
                     pdiff: [0x01, 0x02, 0],
                     ..Default::default()
                 },
@@ -1037,6 +1062,25 @@ mod test {
                 None,
             ),
             (
+                "ScalabilityStructureNoPictureGroupNoPayload",
+                &[
+                    0x0A,
+                    1 << 3, // NS:0 Y:0 G:1
+                    0,      // N_G=0, valid: single temporal layer / no fixed dependency info
+                ],
+                Vp9Depacketizer {
+                    b: true,
+                    v: true,
+                    ns: 0,
+                    y: false,
+                    g: true,
+                    ng: 0,
+                    ..Default::default()
+                },
+                &[],
+                None,
+            ),
+            (
                 "ScalabilityStructureThreeLayers",
                 &[
                     0x0A,
@@ -1085,6 +1129,7 @@ mod test {
                     f: true,
                     b: true,
                     picture_id: 17,
+                    extended_pid: Some(17),
                     pdiff: [17, 18, 127],
                     ..Default::default()
                 },
@@ -1121,11 +1166,9 @@ mod test {
 
     #[test]
     fn test_vp9_packetizer_payload() -> Result<(), PacketError> {
-        let mut r0 = 8692;
         let mut rands = vec![];
-        for _ in 0..10 {
+        for r0 in 8692..8702 {
             rands.push(vec![(r0 >> 8) as u8 | 0x80, (r0 & 0xFF) as u8]);
-            r0 += 1;
         }
 
         // Non-flexible mode (F=0) header layout:
@@ -1133,7 +1176,7 @@ mod test {
         //   Bytes 1-2: 15-bit PID (M=1)
         //   Byte 3: TID(3)|U(1)|SID(3)|D(1) = 0x10 (TID=0, U=1, SID=0, D=0)
         //   Byte 4: tl0picidx (wrapping u8, increments every frame)
-        //   [Bytes 5-7]: SS data on keyframe first packet only
+        //   [Byte 5]: SS data on keyframe first packet only (N_S=0, Y=0, G=0)
         //
         // Flags byte (non-keyframe): I=1,P=1,L=1,F=0 = 0xE0 base
         //   + B=0x08, E=0x04
@@ -1254,19 +1297,23 @@ mod test {
         assert_eq!(pkt[0], 0xAE, "Keyframe flags should be 0xAE");
         // PID
         assert_eq!(pkt[1], (100 >> 8) as u8 | 0x80);
-        assert_eq!(pkt[2], 100 & 0xFF);
+        assert_eq!(pkt[2], 100);
         // L byte: TID=0, U=1, SID=0, D=0
         assert_eq!(pkt[3], 0x10);
         // tl0picidx = 1 (first frame)
         assert_eq!(pkt[4], 1);
-        // SS: N_S=0, Y=0, G=1 → 0x08
-        assert_eq!(pkt[5], 0x08);
-        // N_G=1
-        assert_eq!(pkt[6], 0x01);
-        // GOF[0]: TID=0, U=0, R=0
-        assert_eq!(pkt[7], 0x00);
-        // Payload
-        assert_eq!(&pkt[8..], &keyframe[..]);
+        // SS: N_S=0, Y=0, G=0 (no GOF) → 0x00 (1 byte)
+        assert_eq!(pkt[5], 0x00);
+        // Payload starts right after the 1-byte SS
+        assert_eq!(&pkt[6..], &keyframe[..]);
+
+        // Parse-side: the emitted SS decodes as a single-layer, no-GOF structure (N_S=0, Y/G false).
+        let mut dep = Vp9Depacketizer::default();
+        let mut out = Vec::new();
+        let mut extra = CodecExtra::None;
+        dep.depacketize(pkt, &mut out, &mut extra)?;
+        assert!(dep.v && dep.ns == 0 && !dep.y && !dep.g && dep.ng == 0);
+        assert_eq!(&out[..], &keyframe[..]);
 
         // Now an inter-frame: 0x84 = 0b10_00_0_1_00 (frame_type=1)
         let inter = vec![0x84, 0xCC];
@@ -1291,8 +1338,8 @@ mod test {
         };
 
         // VP9 profile 0 keyframe: 0x82 = frame_marker=10, profile=00, show_existing=0, frame_type=0
-        // 10 bytes of payload, MTU=12 → max_frag = 12 - 8 = 4
-        // First packet: 8-byte header (with SS) + 4 bytes payload = 12 ≤ MTU
+        // 10 bytes of payload, MTU=12 → max_frag = 12 - 8 = 4 (conservative reserve)
+        // First packet: 6-byte header (with 1-byte G=0 SS) + 4 bytes payload = 10 ≤ MTU
         // Second packet: 5-byte header + 4 bytes payload = 9 ≤ MTU
         // Third packet: 5-byte header + 2 bytes payload = 7 ≤ MTU
         let keyframe = vec![0x82, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
@@ -1307,13 +1354,11 @@ mod test {
         // Packet 1: B=1, E=0, V=1 (keyframe first)
         // Flags: I=1,P=0,L=1,F=0,B=1,E=0,V=1,Z=0 = 0xAA
         assert_eq!(packets[0][0], 0xAA);
-        assert_eq!(packets[0].len(), 12); // 8-byte header + 4-byte payload
+        assert_eq!(packets[0].len(), 10); // 6-byte header + 4-byte payload
         assert_eq!(packets[0][3], 0x10); // L byte
         assert_eq!(packets[0][4], 1); // tl0picidx
-        assert_eq!(packets[0][5], 0x08); // SS byte 1
-        assert_eq!(packets[0][6], 0x01); // SS byte 2 (N_G)
-        assert_eq!(packets[0][7], 0x00); // SS byte 3 (GOF[0])
-        assert_eq!(&packets[0][8..], &keyframe[0..4]); // payload
+        assert_eq!(packets[0][5], 0x00); // SS byte: N_S=0, Y=0, G=0 (no GOF)
+        assert_eq!(&packets[0][6..], &keyframe[0..4]); // payload
 
         // Packet 2: B=0, E=0, V=0 (middle)
         // Flags: I=1,P=0,L=1,F=0,B=0,E=0,V=0,Z=0 = 0xA0
@@ -1372,13 +1417,212 @@ mod test {
         Ok(())
     }
 
+    fn depacketize_one(depack: &mut Vp9Depacketizer, packet: &[u8]) -> Vp9CodecExtra {
+        let mut payload = Vec::new();
+        let mut extra = CodecExtra::None;
+        depack
+            .depacketize(packet, &mut payload, &mut extra)
+            .unwrap();
+        let CodecExtra::Vp9(extra) = extra else {
+            panic!("expected VP9 codec extra");
+        };
+        extra
+    }
+
+    #[test]
+    fn depacketizer_extends_picture_id_and_tl0picidx() {
+        let mut depack = Vp9Depacketizer::default();
+
+        for (pid, tl0, expected_pid, expected_tl0) in [
+            (0x7FFE_u16, 254_u8, 0x7FFE_u64, 254_u64),
+            (0x7FFF, 255, 0x7FFF, 255),
+            (0, 0, 0x8000, 256),
+            (1, 1, 0x8001, 257),
+        ] {
+            // I=1 L=1 B=1 E=1, 15-bit picture id, TID=0, tl0picidx
+            let packet = [0xAC, 0x80 | (pid >> 8) as u8, pid as u8, 0x00, tl0, 0xAA];
+            let extra = depacketize_one(&mut depack, &packet);
+            assert_eq!(extra.picture_id, Some(expected_pid), "pid {pid}");
+            assert_eq!(extra.tl0_picture_id, Some(expected_tl0), "tl0 {tl0}");
+        }
+    }
+
+    #[test]
+    fn depacketizer_extends_7_bit_picture_id() {
+        let mut depack = Vp9Depacketizer::default();
+
+        for (pid, expected) in [(126_u8, 126_u64), (127, 127), (0, 128), (1, 129)] {
+            // I=1 B=1 E=1, 7-bit picture id
+            let extra = depacketize_one(&mut depack, &[0x8C, pid, 0xAA]);
+            assert_eq!(extra.picture_id, Some(expected), "pid {pid}");
+        }
+    }
+
+    #[test]
+    fn depacketizer_reports_missing_picture_id() {
+        let mut depack = Vp9Depacketizer::default();
+
+        let extra = depacketize_one(&mut depack, &[0xAC, 0x92, 0x34, 0x00, 7, 0xAA]);
+        assert_eq!(extra.picture_id, Some(0x1234));
+
+        // I=0 L=1 B=1 E=1
+        let extra = depacketize_one(&mut depack, &[0x2C, 0x00, 8, 0xAA]);
+        assert_eq!(extra.picture_id, None);
+        assert_eq!(extra.tl0_picture_id, Some(8));
+
+        // Picture id on the first packet of the frame only
+        let mut payload = Vec::new();
+        let mut extra = CodecExtra::None;
+        depack
+            .depacketize(&[0xA8, 0x92, 0x35, 0x00, 9, 0xAA], &mut payload, &mut extra)
+            .unwrap();
+        depack
+            .depacketize(&[0x24, 0x00, 9, 0xBB], &mut payload, &mut extra)
+            .unwrap();
+        let CodecExtra::Vp9(extra) = extra else {
+            panic!("expected VP9 codec extra");
+        };
+        assert_eq!(extra.picture_id, Some(0x1235));
+    }
+
+    fn assert_every_frame_emitted(frames: impl IntoIterator<Item = Vec<Vec<u8>>>) {
+        use crate::packet::{CodecDepacketizer, DepacketizingBuffer, RtpMeta};
+        use crate::rtp_::{MediaTime, RtpHeader};
+        use std::time::Instant;
+
+        let mut buf =
+            DepacketizingBuffer::new(CodecDepacketizer::Vp9(Vp9Depacketizer::default()), 3);
+        let now = Instant::now();
+        let mut seq = 0_u64;
+
+        for (frame, packets) in frames.into_iter().enumerate() {
+            let count = packets.len();
+            let time = frame as u64 * 3000;
+
+            for (i, packet) in packets.into_iter().enumerate() {
+                let meta = RtpMeta {
+                    received: now,
+                    time: MediaTime::from_90khz(time),
+                    seq_no: seq.into(),
+                    last_sender_info: None,
+                    header: RtpHeader {
+                        sequence_number: seq as u16,
+                        timestamp: time as u32,
+                        marker: i == count - 1,
+                        ..Default::default()
+                    },
+                };
+                buf.push(meta, packet);
+                seq += 1;
+            }
+
+            let dep = buf
+                .pop(now, None)
+                .unwrap_or_else(|| panic!("frame {frame} was not emitted"))
+                .unwrap();
+            assert!(dep.contiguous, "frame {frame} is not contiguous");
+        }
+    }
+
+    #[test]
+    fn depacketizing_buffer_emits_every_frame_across_wraps() {
+        let mut pck = Vp9Packetizer {
+            initial_picture_id: 0x7FFF - 100,
+            tl0picidx: 200,
+            ..Default::default()
+        };
+        let frames: Vec<_> = (0..300)
+            .map(|frame| {
+                let first_byte = if frame == 0 { 0x80 } else { 0x84 };
+                pck.packetize(10, &[first_byte, 1, 2, 3]).unwrap()
+            })
+            .collect();
+
+        assert_every_frame_emitted(frames);
+    }
+
+    #[test]
+    fn depacketizing_buffer_emits_every_frame_with_7_bit_picture_id() {
+        // I=1 L=1 B=1 E=1 (P=1 after the first frame), 7-bit picture id, TID=0, tl0picidx
+        let frames = (0..600_u64).map(|frame| {
+            let flags = if frame == 0 { 0xAC } else { 0xEC };
+            vec![vec![flags, (frame & 0x7F) as u8, 0x00, frame as u8, 0x84]]
+        });
+
+        assert_every_frame_emitted(frames);
+    }
+
+    #[test]
+    fn depacketizing_buffer_emits_every_frame_without_picture_id() {
+        // I=0 L=1 B=1 E=1 (P=1 after the first frame), TID=0, tl0picidx
+        let frames = (0..300_u64).map(|frame| {
+            let flags = if frame == 0 { 0x2C } else { 0x6C };
+            vec![vec![flags, 0x00, frame as u8, 0x84]]
+        });
+
+        assert_every_frame_emitted(frames);
+    }
+
+    #[test]
+    fn depacketizer_preserves_picture_id_epoch_when_width_grows() {
+        let mut depack = Vp9Depacketizer::default();
+        for (pid, expected) in [(126_u8, 126_u64), (127, 127), (0, 128), (1, 129)] {
+            let extra = depacketize_one(&mut depack, &[0x8C, pid, 0xAA]);
+            assert_eq!(extra.picture_id, Some(expected));
+        }
+        // RFC 9628 section 4.2: transitioning to 15 bits zero-extends the wire ID.
+        let extra = depacketize_one(&mut depack, &[0x8C, 0x80, 2, 0xAA]);
+        assert_eq!(extra.picture_id, Some(130));
+    }
+
+    #[test]
+    fn depacketizing_buffer_emits_frames_when_picture_id_width_grows() {
+        let frames = [
+            vec![vec![0xAC, 126, 0, 10, 0x80]],
+            vec![vec![0xEC, 127, 0, 11, 0x84]],
+            // A keyframe at the short-ID wrap lets the pre-PR code resynchronize.
+            vec![vec![0xAC, 0, 0, 12, 0x80]],
+            vec![vec![0xEC, 1, 0, 13, 0x84]],
+            // The following picture has wire ID 0x0002 and M=1.
+            vec![vec![0xEC, 0x80, 2, 0, 14, 0x84]],
+            vec![vec![0xEC, 0x80, 3, 0, 15, 0x84]],
+        ];
+        assert_every_frame_emitted(frames);
+    }
+
+    #[test]
+    fn depacketizer_preserves_wide_picture_id_after_loss_at_width_growth() {
+        let mut depack = Vp9Depacketizer::default();
+        assert_eq!(
+            depacketize_one(&mut depack, &[0x8C, 0, 0xAA]).picture_id,
+            Some(0)
+        );
+        // The sender widens at PID 1; pictures 1..99 are lost in transit.
+        let extra = depacketize_one(&mut depack, &[0x8C, 0x80, 100, 0xAA]);
+        assert_eq!(extra.picture_id, Some(100));
+    }
+
+    #[test]
+    fn depacketizing_buffer_recovers_after_loss_at_picture_id_width_growth() {
+        // A middlebox drops enhancement pictures 1..99 and rewrites RTP sequence numbers.
+        // Picture 100 is a keyframe, so all following pictures are decodable.
+        let frames =
+            std::iter::once(vec![vec![0xAC, 0, 0, 0, 0x80]]).chain((100..=130_u8).map(|pid| {
+                let (flags, payload) = if pid == 100 {
+                    (0xAC, 0x80)
+                } else {
+                    (0xEC, 0x84)
+                };
+                vec![vec![flags, 0x80, pid, 0, pid - 99, payload]]
+            }));
+        assert_every_frame_emitted(frames);
+    }
+
     #[test]
     fn test_vp9_packetizer_flexible_mode() -> Result<(), PacketError> {
-        let mut r0 = 8692;
         let mut rands = vec![];
-        for _ in 0..10 {
+        for r0 in 8692..8702 {
             rands.push(vec![(r0 >> 8) as u8 | 0x80, (r0 & 0xFF) as u8]);
-            r0 += 1;
         }
 
         // With VP9_FLEXIBLE_HEADER_SIZE=3, min productive MTU is 4.
@@ -1542,5 +1786,28 @@ mod test {
         assert!(!detect_vp9_keyframe(&[0xEC])); // I=1, P=1, L=1, B=1, E=1
         assert!(!detect_vp9_keyframe(&[0x40])); // P=1 only
         assert!(!detect_vp9_keyframe(&[0xD5])); // I=1, P=1, F=1, E=1, Z=1
+    }
+
+    #[test]
+    fn packetize_respects_mtu() -> Result<(), PacketError> {
+        // VP9 profile 0 keyframe header followed by payload bytes.
+        let mut payload = vec![0x82u8];
+        payload.extend(std::iter::repeat_n(0xABu8, 2000));
+        for &mtu in &[100usize, 300, 600, 1200] {
+            let mut pck = Vp9Packetizer {
+                initial_picture_id: 100,
+                ..Default::default()
+            };
+            let pkts = pck.packetize(mtu, &payload)?;
+            assert!(!pkts.is_empty(), "VP9 produced no packets at mtu {mtu}");
+            for (i, pkt) in pkts.iter().enumerate() {
+                assert!(
+                    pkt.len() <= mtu,
+                    "VP9 packet {i} size {} > mtu {mtu}",
+                    pkt.len()
+                );
+            }
+        }
+        Ok(())
     }
 }

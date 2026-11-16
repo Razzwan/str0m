@@ -15,9 +15,6 @@ pub use sha256::*;
 mod srtp;
 pub use srtp::*;
 
-mod dtls;
-pub use dtls::*;
-
 #[derive(Debug)]
 pub enum WinCryptoError {
     Generic(String),
